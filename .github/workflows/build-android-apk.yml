@@ -1,0 +1,94 @@
+name: Build Android APK (keyless)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+
+jobs:
+  android:
+    name: Android arm64 (locally signed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK / NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri android init --ci
+      - name: Build unsigned APK (arm64 only)
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Generate throwaway keystore and sign APK
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/hghub.p12"
+          keytool -genkeypair -storetype PKCS12 -keystore "$KS" -alias hghub \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass hghublocal -keypass hghublocal \
+            -dname "CN=HGhub Local, OU=Local, O=Local, L=Local, ST=Local, C=CN"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          BIN="$ANDROID_SDK_ROOT/build-tools/$BT"
+          mkdir -p artifacts
+          found=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk'); do
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            aligned="$RUNNER_TEMP/aligned.apk"
+            "$BIN/zipalign" -f -p 4 "$f" "$aligned"
+            out="artifacts/HGhub_${VERSION}_${abi}.apk"
+            "$BIN/apksigner" sign --ks "$KS" --ks-type PKCS12 --ks-key-alias hghub \
+              --ks-pass pass:hghublocal --key-pass pass:hghublocal \
+              --v4-signing-enabled false --out "$out" "$aligned"
+            "$BIN/apksigner" verify --print-certs "$out" | head -4
+            found=$((found+1))
+          done
+          rm -f "$KS" "$RUNNER_TEMP/aligned.apk"
+          if [ "$found" -eq 0 ]; then echo "::error::no release APK found"; exit 1; fi
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
